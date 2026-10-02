@@ -35,14 +35,27 @@ kind=$(printf  '%s' "$pane" | jq -r '.agent_session.kind  // empty')
 value=$(printf '%s' "$pane" | jq -r '.agent_session.value // empty')
 
 case "$agent" in
-  claude | codex) ;;
-  "") echo "pane $pane_id has no agent: focus a Claude Code or Codex pane" >&2; exit 1 ;;
-  *)  echo "agent '$agent' in pane $pane_id is not one zoe reads (Claude Code and Codex)" >&2; exit 1 ;;
+  claude | codex) provider=$agent ;;
+  cmd | commandcode) provider=commandcode ;;
+  "") echo "pane $pane_id has no agent: focus an agent pane (Claude Code, Codex or Command Code)" >&2; exit 1 ;;
+  *)  echo "agent '$agent' in pane $pane_id is not one zoe reads (Claude Code, Codex and Command Code)" >&2; exit 1 ;;
 esac
 
 case "$kind" in
   id) ;;
-  "") cat >&2 <<MSG
+  "")
+     # Command Code: Herdr's session refs are ignored on 0.9.x servers (they
+     # land with the resume machinery in 0.10), so fall back to the pane's
+     # directory — zoe follows the newest Command Code session of that project.
+     # The "dir" mode tells open.sh to open the directory instead of an id.
+     if [ "$provider" = commandcode ]; then
+       cwd=$(printf '%s' "$pane" | jq -r '.foreground_cwd // .cwd // empty')
+       if [ -n "$cwd" ]; then
+         printf '%s %s dir\n' "$provider" "$cwd"
+         exit 0
+       fi
+     fi
+     cat >&2 <<MSG
 Herdr has no session id for this $agent pane.
 
   The id comes from the agent's SessionStart hook, which fires only when a
@@ -51,9 +64,10 @@ Herdr has no session id for this $agent pane.
   integration was installed never reports one.
 
     herdr integration install $agent    (herdr integration status lists them)
+    for a cmd pane: restart cmd there, so its channel plugin reports the id
 MSG
      exit 1 ;;
   *)  echo "Herdr reports a $kind for this $agent pane, and the plugin expects an id" >&2; exit 1 ;;
 esac
 
-printf '%s %s\n' "$agent" "$value"
+printf '%s %s\n' "$provider" "$value"

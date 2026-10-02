@@ -1,0 +1,39 @@
+# Shared environment for this project's fun-ci stages. Sourced, never executed:
+# fun-ci's stage set is fixed at four (lint, build, fast, slow), so a helper in
+# here is never mistaken for a stage.
+#
+# Each stage builds into its own CARGO_TARGET_DIR under ~/.cache. fun-ci runs a
+# commit in a fresh git worktree whose target/ is empty, so without this every
+# run would pay a cold build and blow the 30s lint/build budgets. The directory
+# is named for the worktree slot (one slot, see .fun-ci/config) and for a group:
+# clippy gets its own, because its fingerprints differ from a build's and it
+# runs beside build.sh; build.sh and every suite share one, so fast.sh and
+# slow.sh/test.sh run on what build.sh built instead of compiling.
+#
+# $0 is resolved to an absolute path first: sourced from a relative invocation,
+# dirname-of-dirname would be `.` and the target dir would be named after it.
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+SLOT=$(basename "$(dirname "$(dirname "$SELF")")")
+STAGE=$(basename "$SELF" .sh)
+
+case "$STAGE" in
+    lint) SUFFIX=lint ;;
+    *)    SUFFIX=build ;;
+esac
+
+CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/.cache/zoetrope-target-$SLOT-$SUFFIX}
+
+# Three cores at most (project rule, 2026-10-02): every stage of this pipeline
+# is pinned to cores 0-2, so the whole run — lint and build running beside each
+# other included — can never occupy more than three cores. CARGO_BUILD_JOBS
+# additionally caps compile parallelism inside the pin.
+CORES=$(nproc 2>/dev/null || echo 2)
+[ "$CORES" -gt 3 ] && JOBS=3 || JOBS=$CORES
+CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-$JOBS}
+
+# The pin itself: every stage prefixes its cargo invocation with $TASKSET.
+# Empty on machines with fewer than three cores, where taskset -c 0-2 fails.
+TASKSET=
+[ "$CORES" -ge 3 ] && TASKSET="taskset -c 0-2"
+
+export CARGO_TARGET_DIR CARGO_BUILD_JOBS TASKSET

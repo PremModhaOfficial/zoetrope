@@ -1,0 +1,7 @@
+  ◌ [main] commandcode  (idle) — id=main
+      model: claude-sonnet-4-5
+      tools: 2 (2✓ 0✗ 0⏳)   tokens: 184
+    ✓ [subagent] Verify exporter tests pass  (done) — id=call_02_agent
+        tools: 0 (0✓ 0✗ 0⏳)   tokens: 0
+        ↳ prompt: Add a --dry-run flag to the exporter and run the tests.
+        ↳ thought: Run the suite once before touching the flag path.

@@ -1,0 +1,8 @@
+# fun-ci's settings for this project (lib/fun_ci/setup/settings.rb).
+#
+# One worktree slot, not the default two. A slot is a fresh git worktree, and
+# the cargo cache each stage builds into is named for its slot (see env): with
+# two slots, wherever a run lands is as likely to be the cold one, and a cold
+# build of this workspace does not fit the 30s lint/build budgets. One slot
+# keeps the caches warm, and lint and build still run in parallel inside it.
+worktree_slots: 1

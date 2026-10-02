@@ -73,6 +73,7 @@ use crate::fact::Statement;
 // browser frontend goes through `tailer::Bundle`.
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod commandcode;
 pub(crate) mod summary;
 
 #[cfg(test)]
@@ -85,16 +86,21 @@ pub(crate) mod harness;
 pub enum Provider {
     Claude,
     Codex,
+    CommandCode,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    /// `CommandCode` before `Claude`: [`open`]'s layout fallback walks this
+    /// order, so a just-created `<uuid>.jsonl` under a `projects/` tree claims
+    /// as Command Code before Claude's `.jsonl`-greedy classifier sees it.
+    pub const ALL: [Provider; 3] = [Provider::Codex, Provider::CommandCode, Provider::Claude];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::CommandCode => "commandcode",
         }
     }
 
@@ -116,6 +122,7 @@ impl Provider {
 pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
+    CommandCode(commandcode::Stream),
 }
 
 impl Stream {
@@ -125,6 +132,7 @@ impl Stream {
         match self {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
+            Stream::CommandCode(s) => s.push(line),
         }
     }
 }
@@ -139,6 +147,11 @@ pub fn provider_of(head: &str) -> Option<Provider> {
     let kind = obj.get("type").and_then(|t| t.as_str());
     if kind == Some("session_meta") || obj.contains_key("payload") {
         return Some(Provider::Codex);
+    }
+    // A Command Code header: `type == "session"` with a numeric `version`.
+    // A `session` without one is not this format and stays Claude's below.
+    if kind == Some("session") && obj.get("version").is_some_and(|v| v.is_number()) {
+        return Some(Provider::CommandCode);
     }
     kind.map(|_| Provider::Claude)
 }
@@ -340,6 +353,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
+            Provider::CommandCode => commandcode::discovery::all_paths(scope),
         }
     }
 
@@ -348,6 +362,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
+            Provider::CommandCode => commandcode::discovery::session_file(path),
         }
     }
 
@@ -358,6 +373,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
+            Provider::CommandCode => commandcode::discovery::related_paths(file),
         }
     }
 
@@ -366,6 +382,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
+            Provider::CommandCode => commandcode::discovery::project_key(cwd),
         }
     }
 
@@ -376,6 +393,9 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::CommandCode => {
+                commandcode::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH)
+            }
         }
     }
 
@@ -384,6 +404,7 @@ impl Provider {
         match self {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
+            Provider::CommandCode => Stream::CommandCode(commandcode::discovery::stream_for(file)),
         }
     }
 
@@ -394,6 +415,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::sidecar(file, text),
             Provider::Codex => None,
+            Provider::CommandCode => commandcode::discovery::sidecar(file, text),
         }
     }
 }
@@ -573,6 +595,20 @@ mod tests {
             provider_of("\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}\n"),
             Some(Provider::Codex)
         );
+        // A Command Code header: `type == "session"` with a numeric version.
+        assert_eq!(
+            provider_of(r#"{"type":"session","version":3,"id":"x","cwd":"/project"}"#),
+            Some(Provider::CommandCode)
+        );
+        // A session without a numeric version is not Command Code's.
+        assert_eq!(
+            provider_of(r#"{"type":"session","id":"x"}"#),
+            Some(Provider::Claude)
+        );
+        assert_eq!(
+            provider_of(r#"{"type":"session","version":"3","id":"x"}"#),
+            Some(Provider::Claude)
+        );
         assert_eq!(
             provider_of(r#"{"type":"mode","mode":"normal","sessionId":"demo"}"#),
             Some(Provider::Claude)
@@ -586,6 +622,41 @@ mod tests {
         assert_eq!(provider_of(r#"{"agentType":"guide"}"#), None);
         assert_eq!(provider_of("not json"), None);
         assert_eq!(provider_of(""), None);
+    }
+
+    /// The Command Code primitives: single-file sessions (nothing related,
+    /// nothing whole-read), the slug project key and the layout-fallback
+    /// order.
+    #[test]
+    fn commandcode_primitives_are_single_file() {
+        let f = SessionFile {
+            provider: Provider::CommandCode,
+            path: PathBuf::from("/p/x.jsonl"),
+            session: "x".into(),
+            role: FileRole::Root,
+            read: ReadMode::Tail,
+            project_key: "p".into(),
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        assert_eq!(Provider::CommandCode.sidecar(&f, "{}"), None);
+        assert_eq!(
+            Provider::CommandCode.related_paths(&f),
+            Vec::<PathBuf>::new()
+        );
+        assert!(matches!(
+            Provider::CommandCode.stream_for(&f),
+            Stream::CommandCode(_)
+        ));
+        assert_eq!(
+            Provider::CommandCode.project_key(Path::new("/p")),
+            "p".to_string()
+        );
+        assert_eq!(Provider::CommandCode.name(), "commandcode");
+        assert_eq!(Provider::parse("commandcode"), Some(Provider::CommandCode));
+        assert_eq!(
+            Provider::ALL,
+            [Provider::Codex, Provider::CommandCode, Provider::Claude]
+        );
     }
 
     #[test]
@@ -716,5 +787,139 @@ mod tests {
         let via_child = open(&Target::Path(rollouts[1].clone()), None).unwrap();
         assert_eq!(via_child.id, root.id);
         assert_eq!(via_child.root.path, root.root.path);
+    }
+
+    // S-014
+    #[test]
+    fn s_014_provider_of_dispatches_commandcode_head() {
+        let cases: [(&str, Option<Provider>); 9] = [
+            (
+                r#"{"type":"session","version":3,"id":"0b7aa2b4-1111-4111-8111-111111111111","cwd":"/project"}"#,
+                Some(Provider::CommandCode),
+            ),
+            // A `session` without a numeric version is not Command Code's.
+            (r#"{"type":"session","id":"x"}"#, Some(Provider::Claude)),
+            (
+                r#"{"type":"session","version":"3","id":"x"}"#,
+                Some(Provider::Claude),
+            ),
+            (
+                r#"{"type":"mode","mode":"normal","sessionId":"demo"}"#,
+                Some(Provider::Claude),
+            ),
+            (
+                r#"{"timestamp":"t","ordinal":0,"type":"session_meta","payload":{"id":"a"}}"#,
+                Some(Provider::Codex),
+            ),
+            (
+                r#"{"type":"response_item","payload":{"type":"message"}}"#,
+                Some(Provider::Codex),
+            ),
+            (r#"{"agentType":"guide"}"#, None),
+            ("not json", None),
+            ("", None),
+        ];
+        for (head, expected) in cases {
+            assert_eq!(provider_of(head), expected, "head: {head}");
+        }
+    }
+
+    // S-015
+    #[test]
+    fn s_015_sweep_open_and_provider_flag() {
+        use crate::provider::commandcode::discovery;
+        use crate::provider::commandcode::test_env::EnvGuard;
+
+        // The name/parse surface.
+        assert_eq!(Provider::CommandCode.name(), "commandcode");
+        assert_eq!(Provider::parse("commandcode"), Some(Provider::CommandCode));
+        assert_eq!(
+            Provider::ALL,
+            [Provider::Codex, Provider::CommandCode, Provider::Claude]
+        );
+
+        let tmp = std::env::temp_dir().join(format!(
+            "zoetrope-commandcode-s015-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let home = tmp.join("home");
+        let project = home.join("projects").join("home-prm-zoet-zoetrope");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = project.join("0e599cbe-23c4-460b-b097-cbd1d6bc0e3d.jsonl");
+        std::fs::write(
+            &session,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"0e599cbe-23c4-460b-b097-cbd1d6bc0e3d\",\"timestamp\":\"2026-09-30T10:00:00.000Z\",\"cwd\":\"/home/prm/zoet/zoetrope\"}\n",
+        )
+        .unwrap();
+        let stale = home
+            .join("projects")
+            .join("tmp")
+            .join("77777777-7777-4777-8777-777777777777.jsonl");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"").unwrap();
+        let outside = tmp
+            .join("outside")
+            .join("66666666-6666-4666-8666-666666666666.jsonl");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"").unwrap();
+
+        let guard = EnvGuard::with_home(&home);
+
+        // Project-scoped listing: exactly the project's uuid-named session.
+        let cwd = Path::new("/home/prm/zoet/zoetrope");
+        assert_eq!(
+            discovery::all_paths(&Scope::project(cwd)),
+            vec![session.clone()]
+        );
+        assert_eq!(
+            discovery::all_paths(&Scope::project(Path::new("/home/prm/zoet/zoetrope/"))),
+            vec![session.clone()],
+            "a trailing slash is the same project"
+        );
+
+        // Sweep, Command Code only — never the developer's real history.
+        for scope_cwd in [
+            Path::new("/home/prm/zoet/zoetrope"),
+            Path::new("/home/prm/zoet/zoetrope/"),
+        ] {
+            let hits = sweep(&Scope::project(scope_cwd), Some(Provider::CommandCode));
+            assert_eq!(hits.len(), 1, "one session for {scope_cwd:?}");
+            assert_eq!(hits[0].provider, Provider::CommandCode);
+            assert_eq!(hits[0].id, "0e599cbe-23c4-460b-b097-cbd1d6bc0e3d");
+            assert_eq!(hits[0].project_key, "home-prm-zoet-zoetrope");
+        }
+
+        // A just-created (empty) file directly under `projects/` opens as
+        // Command Code with the stem as id (O7); the same shape outside any
+        // projects tree still opens as Claude.
+        let provisional = open(&Target::Path(stale.clone()), None).expect("claims provisionally");
+        assert_eq!(provisional.provider, Provider::CommandCode);
+        assert_eq!(provisional.id, "77777777-7777-4777-8777-777777777777");
+        let claude = open(&Target::Path(outside.clone()), None).expect("Claude is .jsonl-greedy");
+        assert_eq!(claude.provider, Provider::Claude);
+
+        // The `--provider commandcode` flag path opens the header id.
+        let flagged =
+            open(&Target::Path(session.clone()), Some(Provider::CommandCode)).expect("opens");
+        assert_eq!(flagged.provider, Provider::CommandCode);
+        assert_eq!(flagged.id, "0e599cbe-23c4-460b-b097-cbd1d6bc0e3d");
+
+        // $COMMANDCODE_HOME wins over $HOME; with it unset, HOME/.commandcode.
+        let fallback = tmp.join("home-fallback");
+        guard.set_home(Some(&fallback));
+        assert_eq!(discovery::commandcode_home(), Some(home.clone()));
+        assert_eq!(discovery::projects_root(), Some(home.join("projects")));
+        guard.set_commandcode_home(None);
+        assert_eq!(
+            discovery::commandcode_home(),
+            Some(fallback.join(".commandcode"))
+        );
+        drop(guard);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

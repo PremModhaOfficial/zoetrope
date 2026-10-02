@@ -76,8 +76,11 @@ The pane says why and waits for you to press enter, rather than closing on you:
 | no agent in the pane | a line saying to focus an agent pane |
 | an agent zoetrope does not read | the same, naming the agent |
 
-There is no fallback through the working directory. Herdr knows the session, so
-the plugin uses it or says what it got instead.
+There is no fallback through the working directory for Claude Code and Codex:
+Herdr knows the session, so the plugin uses it or says what it got instead. The
+one exception is a **cmd** pane: Herdr 0.9.x ignores integrations' session refs
+(they arrive with 0.10's resume machinery), so for `cmd` the plugin follows the
+newest Command Code session of the pane's directory.
 
 ## Keys inside the graph
 
