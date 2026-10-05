@@ -26,6 +26,13 @@ use super::{Flow, TailRequest, UiEvent};
 /// Poll interval for live tailing.
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Torn-read backoff for rewritten documents, in poll ticks. A rewrite in
+/// flight changes the mtime every tick, so without this each tick would
+/// re-read and re-parse the whole (megabyte-scale) document only to fail
+/// again. The skip grows per consecutive failure and is capped here (~2s at
+/// the 200ms interval); the next successful parse resets it, so steady state
+/// never stalls.
+const DOC_BACKOFF_CAP: u32 = 10;
 /// Run the newer-session auto-switch scan every N poll ticks (~2s at the
 /// 200ms interval). The scan stats every session file in the project, which
 /// scales with session HISTORY, not activity — unthrottled it would scan 5×/sec
@@ -58,6 +65,17 @@ pub(crate) struct LiveSession {
     /// stream reading it. One map (paths are unique) so no agent id can
     /// collide across a provider's directory trees.
     tracked: HashMap<PathBuf, (Stream, TailState)>,
+    /// Document streams for non-root rewritten files (plus the mtime last
+    /// stated through each), keyed by absolute path. Unlike tailed files
+    /// these are re-read whole and diffed, not read from an offset.
+    docs: HashMap<PathBuf, (Stream, Option<SystemTime>)>,
+    /// The mtime last stated through the root's stream, when the root is a
+    /// rewritten document. A mid-write read does not advance it (retried).
+    main_doc_mtime: Option<SystemTime>,
+    /// Torn-read backoff for the root document (see [`DOC_BACKOFF_CAP`]).
+    main_doc_backoff: DocBackoff,
+    /// Torn-read backoff per non-root rewritten document.
+    doc_backoff: HashMap<PathBuf, DocBackoff>,
     /// Whole-read sidecars already stated (by absolute path) — state once.
     seen_whole: HashSet<PathBuf>,
     /// Poll-tick counter, used to throttle the newer-session scan.
@@ -100,6 +118,10 @@ impl LiveSession {
             main_state: TailState::default(),
             main_stream,
             tracked: HashMap::new(),
+            docs: HashMap::new(),
+            main_doc_mtime: None,
+            main_doc_backoff: DocBackoff::default(),
+            doc_backoff: HashMap::new(),
             seen_whole: HashSet::new(),
             ticks: 0,
             idle_ticks: 0,
@@ -153,6 +175,40 @@ impl LiveSession {
     /// The target that re-attaches this same session from scratch.
     fn reattach(&self) -> Target {
         Target::Path(self.root_path().to_path_buf())
+    }
+}
+
+/// Torn-read backoff for one rewritten document: consecutive failed parses
+/// skip re-reading for a growing, capped number of poll ticks. Pure (no IO),
+/// so the poll sites stay thin and the behaviour is unit-tested below.
+#[derive(Debug, Default)]
+struct DocBackoff {
+    failures: u32,
+    skip: u32,
+}
+
+impl DocBackoff {
+    /// Whether to re-read this tick. Counts down a skip set by [`failed`](Self::failed).
+    fn ready(&mut self) -> bool {
+        if self.skip > 0 {
+            self.skip -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// A successful parse: steady state resumes immediately, never stalled.
+    fn succeeded(&mut self) {
+        self.failures = 0;
+        self.skip = 0;
+    }
+
+    /// A torn (unparseable) read. Returns `true` on the first consecutive
+    /// failure — the caller logs once there, never per tick.
+    fn failed(&mut self) -> bool {
+        self.failures += 1;
+        self.skip = self.failures.min(DOC_BACKOFF_CAP);
+        self.failures == 1
     }
 }
 
@@ -285,25 +341,75 @@ async fn poll_live(
 
     // --- root file ---
     let root_path = session.root_path().to_path_buf();
-    match read_appended(&root_path, &mut session.main_state) {
-        ReadResult::Reset => {
-            let _ = ui_tx
-                .send(UiEvent::SessionReset {
-                    session_id: session_id.to_string(),
-                })
-                .await;
-            // Truncation = re-attach: returning the SAME session makes run_live
-            // rebuild the whole LiveSession (fresh offsets, seen sidecars,
-            // backfill gate). Patching individual fields in place would leave
-            // the App's wiped model and the tailer's surviving state
-            // inconsistent — agents never re-emitted, and the re-read blips
-            // liveness.
-            return Some(session.reattach());
+    if session.session.root.read == ReadMode::Doc {
+        // A rewritten document: re-read whole and state only what is new.
+        // mtime-gated so an idle session costs a stat, not a parse, per
+        // tick; the replay seed's stream already knows the bulk parse, so
+        // the first re-read states nothing. A torn mid-write read backs off
+        // (a rewrite in flight changes the mtime every tick, which would
+        // otherwise re-parse megabytes 5x/sec to fail again).
+        if session.main_doc_backoff.ready() {
+            let mt = crate::provider::modified(&root_path);
+            if session.main_doc_mtime != Some(mt)
+                && let Ok(text) = std::fs::read_to_string(&root_path)
+            {
+                // Vanishing mid-poll falls through: the mtime gate retries
+                // next tick. A torn parse backs off (below), a good one
+                // states and resets.
+                match session.main_stream.push_doc(&text) {
+                    Some(new) => {
+                        session.main_doc_mtime = Some(mt);
+                        session.main_doc_backoff.succeeded();
+                        statements.extend(new);
+                    }
+                    None => {
+                        if session.main_doc_backoff.failed() {
+                            eprintln!(
+                                "zoe: {} unreadable (mid-write?), backing off",
+                                root_path.display()
+                            );
+                        }
+                    }
+                }
+            }
         }
-        ReadResult::Lines(lines) => {
-            statements.extend(lines.iter().filter_map(|l| session.main_stream.push(l)));
+    // FEEDER HUNK (opencode): the root is the database itself, not text.
+    // Re-read through the bulk snapshot's stream (or a fresh one live), so
+    // only new rows are stated; byte offsets mean nothing here. Tick cost:
+    // `db_statements` first stats the database files (main + WAL/sidecar —
+    // WAL mode leaves the main file's mtime untouched, so all three are
+    // fingerprinted) and skips the full message+part scan while unchanged.
+    // An idle tick is therefore one stat, not three connections and a full
+    // table scan; `connect_ro` also fails fast (~100ms busy_timeout) rather
+    // than blocking the tick on the agent's write lock. Per-row diffing in
+    // the stream keeps gated ticks to stat only.
+    } else if session.session.provider == Provider::Opencode
+        && session.session.root.read == ReadMode::Whole
+    {
+        let provider = session.session.provider;
+        let file = session.session.root.clone();
+        statements.extend(provider.db_statements(&file, &mut session.main_stream));
+    } else {
+        match read_appended(&root_path, &mut session.main_state) {
+            ReadResult::Reset => {
+                let _ = ui_tx
+                    .send(UiEvent::SessionReset {
+                        session_id: session_id.to_string(),
+                    })
+                    .await;
+                // Truncation = re-attach: returning the SAME session makes run_live
+                // rebuild the whole LiveSession (fresh offsets, seen sidecars,
+                // backfill gate). Patching individual fields in place would leave
+                // the App's wiped model and the tailer's surviving state
+                // inconsistent — agents never re-emitted, and the re-read blips
+                // liveness.
+                return Some(session.reattach());
+            }
+            ReadResult::Lines(lines) => {
+                statements.extend(lines.iter().filter_map(|l| session.main_stream.push(l)));
+            }
+            ReadResult::NoChange | ReadResult::Missing => {}
         }
-        ReadResult::NoChange | ReadResult::Missing => {}
     }
 
     // --- the session's other files: known ones and any that appeared ---
@@ -371,12 +477,18 @@ async fn poll_live(
 }
 
 /// The newest of `candidates` if it is a different session than `current`.
-/// Candidates come newest first from [`sweep`].
+/// Candidates come newest first from [`sweep`]. Identity is provider-gated:
+/// opencode sessions all share one database file, so comparing root paths
+/// would never fire between them — compare session ids instead. Other
+/// providers keep the path comparison (one file per session).
 fn newer_session(current: &Session, candidates: Vec<Session>) -> Option<Session> {
-    candidates
-        .into_iter()
-        .next()
-        .filter(|s| s.root.path != current.root.path)
+    candidates.into_iter().next().filter(|s| {
+        if s.provider == Provider::Opencode && current.provider == Provider::Opencode {
+            s.id != current.id
+        } else {
+            s.root.path != current.root.path
+        }
+    })
 }
 
 /// Read appended bytes from each tracked non-root file through its stream.
@@ -402,7 +514,7 @@ fn read_tracked(
 
 /// Register every file the session has, including any that appeared since
 /// the last tick: tailed files are tracked (idempotent), whole-read sidecars
-/// are stated once they parse.
+/// are stated once they parse, rewritten documents are re-read and diffed.
 fn scan_files(session: &mut LiveSession, statements: &mut Vec<Statement>) {
     session.session.rescan();
     let files = session.session.files.clone();
@@ -412,6 +524,51 @@ fn scan_files(session: &mut LiveSession, statements: &mut Vec<Statement>) {
             ReadMode::Tail => session.track(file),
             ReadMode::Whole => {
                 emit_whole(provider, file, &mut session.seen_whole, statements);
+            }
+            ReadMode::Doc => {
+                let ready = session
+                    .doc_backoff
+                    .entry(file.path.clone())
+                    .or_default()
+                    .ready();
+                if !ready {
+                    continue;
+                }
+                let mt = crate::provider::modified(&file.path);
+                let seeded = session.seed_streams.remove(&file.path);
+                let (stream, stated) = session
+                    .docs
+                    .entry(file.path.clone())
+                    .or_insert_with(|| (seeded.unwrap_or_else(|| provider.stream_for(file)), None));
+                if *stated == Some(mt) {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(&file.path) {
+                    // Vanishing mid-poll falls through: retried next tick. A
+                    // torn parse backs off (below), a good one states.
+                    match stream.push_doc(&text) {
+                        Some(new) => {
+                            *stated = Some(mt);
+                            if let Some(backoff) = session.doc_backoff.get_mut(&file.path) {
+                                backoff.succeeded();
+                            }
+                            statements.extend(new);
+                        }
+                        None => {
+                            let first = session
+                                .doc_backoff
+                                .get_mut(&file.path)
+                                .map(DocBackoff::failed)
+                                .unwrap_or(false);
+                            if first {
+                                eprintln!(
+                                    "zoe: {} unreadable (mid-write?), backing off",
+                                    file.path.display()
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -502,6 +659,41 @@ mod tests {
     }
 
     #[test]
+    fn torn_backoff_skips_then_recovers() {
+        let mut b = DocBackoff::default();
+        assert!(b.ready(), "a healthy document reads every tick");
+        // First failure logs once and skips one tick.
+        assert!(b.failed());
+        assert!(!b.ready(), "skip the next tick, not re-parse");
+        assert!(b.ready(), "one skip only after one failure");
+        // Consecutive failures back off proportionally.
+        assert!(!b.failed());
+        assert!(!b.ready());
+        assert!(!b.ready());
+        assert!(b.ready());
+        // The next success resets: steady state never stalls.
+        b.succeeded();
+        assert!(b.failed(), "after a reset the next failure logs again");
+        assert!(!b.ready(), "the backoff applies after a reset too");
+        assert!(b.ready());
+        b.succeeded();
+        assert!(b.ready());
+    }
+
+    #[test]
+    fn torn_backoff_is_capped() {
+        let mut b = DocBackoff::default();
+        for _ in 0..(DOC_BACKOFF_CAP + 5) {
+            b.failed();
+        }
+        let skipped = (0..(DOC_BACKOFF_CAP + 5)).filter(|_| !b.ready()).count();
+        assert_eq!(
+            skipped as u32, DOC_BACKOFF_CAP,
+            "the skip never exceeds the cap, however long the rewrite runs"
+        );
+    }
+
+    #[test]
     fn a_newer_session_is_a_switch_and_the_same_one_is_not() {
         let (dir, a) = claude_session("switch", "11111111-1111-1111-1111-111111111111", "");
         let b = dir.join("99999999-9999-9999-9999-999999999999.jsonl");
@@ -520,6 +712,36 @@ mod tests {
         );
         assert!(newer_session(&current, vec![]).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opencode sessions share one database file, so the auto-switch must
+    /// compare session ids, not root paths — a path comparison never fires
+    /// between two sessions of the same database.
+    #[cfg(feature = "native")]
+    #[test]
+    fn opencode_switch_fires_between_sessions_sharing_one_database() {
+        use crate::provider::opencode::discovery::db_path;
+        use crate::provider::opencode::discovery::support::{scratch_home, seed_session};
+
+        let (_guard, home, _saved) = scratch_home("opswitch");
+        let db = db_path(&home);
+        seed_session(&db, "ses_a", "/proj", 1000);
+        seed_session(&db, "ses_b", "/proj", 2000);
+        let current = open(&Target::Path(db.join("ses_a")), Some(Provider::Opencode)).unwrap();
+        let newer = open(&Target::Path(db.join("ses_b")), Some(Provider::Opencode)).unwrap();
+        assert_eq!(
+            current.root.path, newer.root.path,
+            "both sessions live in the same database file"
+        );
+        assert_eq!(
+            newer_session(&current, vec![newer.clone(), current.clone()]).map(|s| s.id),
+            Some("ses_b".to_string()),
+            "a newer session id is a switch even at the same path"
+        );
+        assert!(
+            newer_session(&current, vec![current.clone()]).is_none(),
+            "the same session id is never a switch"
+        );
     }
 
     #[tokio::test]

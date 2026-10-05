@@ -109,6 +109,18 @@ pub(crate) fn build_replay(
                 seed.offsets.insert(file.path.clone(), consumed);
                 seed.streams.insert(file.path.clone(), stream);
             }
+            // FEEDER HUNK (opencode): the whole-read file is the database
+            // itself, not text. Its stream is kept for the follow-up tail,
+            // whose re-reads state only new rows.
+            ReadMode::Whole if p == Provider::Opencode => {
+                let mut stream = p.stream_for(file);
+                items.extend(
+                    p.db_statements(file, &mut stream)
+                        .into_iter()
+                        .map(ReplayItem::new),
+                );
+                seed.streams.insert(file.path.clone(), stream);
+            }
             // A whole-read sidecar states its facts once it parses; one that
             // does not yet (mid-write) is left for the follow-up tail to retry.
             ReadMode::Whole => {
@@ -117,6 +129,19 @@ pub(crate) fn build_replay(
                 {
                     items.push(ReplayItem::new(statement));
                     seed.seen_whole.insert(file.path.clone());
+                }
+            }
+            // A rewritten document states only what is new since its stream
+            // last saw it. The stream is kept for the follow-up tail, which
+            // re-reads the file through it. A mid-write read states nothing
+            // and keeps no stream (retried on the next tick).
+            ReadMode::Doc => {
+                if let Ok(text) = std::fs::read_to_string(&file.path) {
+                    let mut stream = p.stream_for(file);
+                    if let Some(statements) = stream.push_doc(&text) {
+                        items.extend(statements.into_iter().map(ReplayItem::new));
+                        seed.streams.insert(file.path.clone(), stream);
+                    }
                 }
             }
         }

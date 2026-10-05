@@ -48,6 +48,7 @@ native = [
   "dep:crossterm",
   "dep:futures",
   "dep:anyhow",
+  "dep:rusqlite",
   "ratatui/crossterm",
   "rataflow/crossterm",
 ]
@@ -86,6 +87,10 @@ tokio = { version = "1", features = [
 ], optional = true }
 futures = { version = "0.3", optional = true }
 anyhow = { version = "1", optional = true }
+# SQLite session store of the opencode provider: native-only (the portable
+# core never opens a database — it maps already-read rows). `bundled`
+# compiles the vendored SQLite source, so no system library is needed.
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"], optional = true }
 # Persistent collections: cloning a `SessionModel` shares structure instead of
 # copying it, which is what makes a snapshot ladder rung O(1).
 imbl = "7.0.1"

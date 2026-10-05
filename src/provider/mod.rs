@@ -57,10 +57,16 @@
 //! inherited timestamp, the Codex stream learns whose file it is from the
 //! first line. Both are expected, not deviations.
 //!
-//! This contract covers agents that write one append-only file per thread.
-//! An agent that rewrites a document per turn would add a document push
-//! beside `Stream::push`; one that keeps a database is a different kind of
-//! feeder, not a wider `SessionFile`.
+//! This contract covers agents that write one append-only file per thread,
+//! plus one that rewrites a document per turn: jcode's whole-document files
+//! read through [`Stream::push_doc`] (a diff against the stream's seen ids)
+//! instead of [`Stream::push`]. One that keeps a database is a different kind
+//! of feeder, not a wider `SessionFile`: opencode is still one [`SessionFile`]
+//! per session, but its "file" is a pseudo-path (`<db>/<session-id>`) decoded
+//! by query, and its feeder hunks read SQLite instead of lines — see
+//! [`opencode::discovery`] and the `Opencode` arms in the feeders
+//! (`main::parse_session_fully`, `tailer::replay::build_replay`,
+//! `tailer::live::poll_live`).
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -73,6 +79,9 @@ use crate::fact::Statement;
 // browser frontend goes through `tailer::Bundle`.
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod commandcode;
+pub(crate) mod jcode;
+pub(crate) mod opencode;
 pub(crate) mod summary;
 
 #[cfg(test)]
@@ -85,16 +94,35 @@ pub(crate) mod harness;
 pub enum Provider {
     Claude,
     Codex,
+    CommandCode,
+    Jcode,
+    Opencode,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    // Order: Codex first, Claude last (its top-level `type` match is
+    // greedy); opencode before jcode is arbitrary but fixed. CommandCode
+    // before Claude: `open`'s layout fallback walks this order, so a
+    // just-created `<uuid>.jsonl` under a `projects/` tree claims as
+    // Command Code before Claude's `.jsonl`-greedy classifier sees it.
+    // Both jcode and opencode arrived from sibling worktrees; this
+    // merge fixes the final order.
+    pub const ALL: [Provider; 5] = [
+        Provider::Codex,
+        Provider::Opencode,
+        Provider::Jcode,
+        Provider::CommandCode,
+        Provider::Claude,
+    ];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::CommandCode => "commandcode",
+            Provider::Jcode => "jcode",
+            Provider::Opencode => "opencode",
         }
     }
 
@@ -116,6 +144,9 @@ impl Provider {
 pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
+    CommandCode(commandcode::Stream),
+    Jcode(jcode::Stream),
+    Opencode(opencode::Stream),
 }
 
 impl Stream {
@@ -125,21 +156,94 @@ impl Stream {
         match self {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
+            Stream::CommandCode(s) => s.push(line),
+            Stream::Jcode(s) => s.push(line),
+            Stream::Opencode(s) => s.push(line),
         }
+    }
+
+    /// State what a rewritten whole-document file now says that it did not
+    /// say before. `None` while the text does not parse (a torn mid-write
+    /// read); `Some` (possibly empty) once it does. Line providers state
+    /// nothing here — their files are never read whole.
+    pub fn push_doc(&mut self, text: &str) -> Option<Vec<Statement>> {
+        match self {
+            Stream::Claude(_) | Stream::Codex(_) | Stream::CommandCode(_) | Stream::Opencode(_) => {
+                Some(Vec::new())
+            }
+            Stream::Jcode(s) => s.push_doc(text),
+        }
+    }
+
+    /// Whether this stream reads a rewritten document ([`push_doc`](Self::push_doc))
+    /// rather than appended lines ([`push`](Self::push)). Feeders holding a
+    /// stream route re-reads through it.
+    pub fn is_document(&self) -> bool {
+        matches!(self, Stream::Jcode(_))
     }
 }
 
-/// Which provider wrote this text, from its first record. Content, never a
-/// path or an extension: a Codex line carries a `payload`, a Claude line a
-/// `type` at the top level and nothing else this looks at.
+/// Which provider wrote this text, from its content. A tailed file
+/// contributes its first record; a rewritten document is handed over whole
+/// (its first line alone is a bare `{` and classifies nothing, so the layout
+/// fallback in [`open`] takes it from there). Content, never a path or an
+/// extension: a Codex line carries a `payload`, a Claude line a `type` at the
+/// top level and nothing else this looks at, a jcode document a `messages`
+/// array beside its `working_dir`. Opencode is NOT detected here: its store
+/// is a binary SQLite file, so there is no text head to read — it classifies
+/// by path (`opencode.db`) with a magic probe in
+/// [`opencode::discovery::session_file`]. Its exported JSONL rows
+/// (`{"table":…}`) deliberately do not classify either: they are a
+/// transfer shape, not a session file.
 pub fn provider_of(head: &str) -> Option<Provider> {
+    // A whole document parses as one value; a tail file's lines never do
+    // (trailing records fail the parse), so try the whole text first and the
+    // first record after.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(head)
+        && let Some(p) = provider_of_value(&v)
+    {
+        return Some(p);
+    }
     let line = head.lines().find(|l| !l.trim().is_empty())?;
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    provider_of_value(&v)
+}
+
+/// Which provider wrote one parsed JSON value.
+///
+/// Order matters: jcode is tested BEFORE Codex's `payload` arm, so a jcode
+/// document that happens to smuggle a top-level `payload` key still reads as
+/// jcode when it carries the markers (a `messages` array beside `working_dir`,
+/// `provider_key`, or a `session_`-prefixed `id`).
+///
+/// Returns `None` (safe: the caller falls back to layout/shape) for a bare
+/// `{`, `{"messages":[]}` (no marker to join on), `{"agentType":"guide"}`
+/// (a sidecar, not a transcript), non-objects, and non-JSON.
+fn provider_of_value(v: &serde_json::Value) -> Option<Provider> {
     let obj = v.as_object()?;
+    if obj.get("messages").is_some_and(|m| m.is_array())
+        && (obj.contains_key("working_dir")
+            || obj.contains_key("provider_key")
+            || obj
+                .get("id")
+                .and_then(|i| i.as_str())
+                .is_some_and(|s| s.starts_with("session_")))
+    {
+        return Some(Provider::Jcode);
+    }
     let kind = obj.get("type").and_then(|t| t.as_str());
     if kind == Some("session_meta") || obj.contains_key("payload") {
         return Some(Provider::Codex);
     }
+    // A Command Code header: `type == "session"` with a numeric
+    // `version`. A `session` without one is not this format and stays
+    // Claude's below.
+    if kind == Some("session") && obj.get("version").is_some_and(|v| v.is_number()) {
+        return Some(Provider::CommandCode);
+    }
+    // Claude's greedy top-level `type` fallback: any other typed record is
+    // its line format (a jcode document carries no `type`, but the jcode arm
+    // above keeps this order true if one ever does).
     kind.map(|_| Provider::Claude)
 }
 
@@ -174,11 +278,13 @@ pub enum FileRole {
     Sidecar,
 }
 
-/// How a file is read: line by line as it grows, or whole, once it parses.
+/// How a file is read: line by line as it grows, whole once it parses, or as
+/// a rewritten document that is re-read and diffed on every pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadMode {
     Tail,
     Whole,
+    Doc,
 }
 
 /// What the core assembles from files. Never produced by a provider.
@@ -340,6 +446,9 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
+            Provider::CommandCode => commandcode::discovery::all_paths(scope),
+            Provider::Jcode => jcode::discovery::all_paths(scope),
+            Provider::Opencode => opencode::discovery::all_paths(scope),
         }
     }
 
@@ -348,6 +457,9 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
+            Provider::CommandCode => commandcode::discovery::session_file(path),
+            Provider::Jcode => jcode::discovery::session_file(path),
+            Provider::Opencode => opencode::discovery::session_file(path),
         }
     }
 
@@ -358,6 +470,9 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
+            Provider::CommandCode => commandcode::discovery::related_paths(file),
+            Provider::Jcode => jcode::discovery::related_paths(file),
+            Provider::Opencode => opencode::discovery::related_paths(file),
         }
     }
 
@@ -366,16 +481,27 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
+            Provider::CommandCode => commandcode::discovery::project_key(cwd),
+            Provider::Jcode => jcode::discovery::project_key(cwd),
+            Provider::Opencode => opencode::discovery::project_key(cwd),
         }
     }
 
     /// [`session_file`](Self::session_file) without a filesystem: the path a
     /// file came with and its first bytes. A Claude file is classified by its
-    /// path, a Codex file by its first line. The browser's way in.
+    /// path, a Codex file by its first line, a jcode file by its path (its
+    /// first line is a bare `{`). The browser's way in. Opencode has no text
+    /// head to classify (its store is SQLite, unreadable without the `native`
+    /// feature), so this is always `None` for it.
     pub fn session_file_from(self, path: &Path, head: &str) -> Option<SessionFile> {
         match self {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::CommandCode => {
+                commandcode::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH)
+            }
+            Provider::Jcode => jcode::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
+            Provider::Opencode => None,
         }
     }
 
@@ -384,16 +510,40 @@ impl Provider {
         match self {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
+            Provider::CommandCode => Stream::CommandCode(commandcode::discovery::stream_for(file)),
+            Provider::Jcode => Stream::Jcode(jcode::discovery::stream_for(file)),
+            Provider::Opencode => Stream::Opencode(opencode::discovery::stream_for(file)),
         }
     }
 
     /// What one of this provider's whole-read sidecars states, once its text
     /// parses. `None` while it does not (a mid-write read) or if the provider
-    /// has no such files.
+    /// has no such files. Document providers state nothing here: their files
+    /// go through [`Stream::push_doc`], not this. Opencode's whole-read file
+    /// is the database itself, read by [`db_statements`](Self::db_statements),
+    /// not by this.
     pub fn sidecar(self, file: &SessionFile, text: &str) -> Option<Statement> {
         match self {
             Provider::Claude => claude::discovery::sidecar(file, text),
             Provider::Codex => None,
+            Provider::CommandCode => commandcode::discovery::sidecar(file, text),
+            Provider::Jcode => None,
+            Provider::Opencode => opencode::discovery::sidecar(file, text),
+        }
+    }
+
+    /// A database-backed file's statements (opencode): rows from SQLite
+    /// through `stream`, only what is new on a re-read. Empty for every
+    /// other provider, whose `Whole` files are text sidecars read via
+    /// [`sidecar`](Self::sidecar). Native only: without SQLite there is no
+    /// database to read. The feeders' database hunk, in one place.
+    #[cfg(feature = "native")]
+    pub fn db_statements(self, file: &SessionFile, stream: &mut Stream) -> Vec<Statement> {
+        match (self, stream) {
+            (Provider::Opencode, Stream::Opencode(s)) => {
+                opencode::statements_for(&file.path, &file.session, s)
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -470,23 +620,33 @@ pub fn sweep(scope: &Scope, only: Option<Provider>) -> Vec<Session> {
 pub fn open(target: &Target, only: Option<Provider>) -> Result<Session, OpenError> {
     let file = match target {
         Target::Path(path) => {
-            if !path.is_file() {
-                return Err(OpenError::NotFound(target.clone()));
+            // Database pseudo-paths (`<db>/<session-id>`) name no file on
+            // disk, so classify them BEFORE the `is_file` gate below, which
+            // would reject them as not-found. `session_file` probes the parent
+            // database's SQLite magic, so a non-database path falls through.
+            if only.is_none_or(|o| o == Provider::Opencode)
+                && let Some(f) = Provider::Opencode.session_file(path)
+            {
+                f
+            } else {
+                if !path.is_file() {
+                    return Err(OpenError::NotFound(target.clone()));
+                }
+                // Content first; failing that (an empty, just-created file), the
+                // first provider whose layout claims the path.
+                let p = only
+                    .or_else(|| read_head(path).and_then(|head| provider_of(&head)))
+                    .or_else(|| {
+                        Provider::ALL
+                            .into_iter()
+                            .find(|p| p.session_file(path).is_some())
+                    })
+                    .ok_or_else(|| OpenError::Unrecognized(path.clone()))?;
+                // Any file of a session opens the session: the rest of it, root
+                // included, is wherever the provider says files of one session are.
+                p.session_file(path)
+                    .ok_or_else(|| OpenError::Unrecognized(path.clone()))?
             }
-            // Content first; failing that (an empty, just-created file), the
-            // first provider whose layout claims the path.
-            let p = only
-                .or_else(|| read_head(path).and_then(|head| provider_of(&head)))
-                .or_else(|| {
-                    Provider::ALL
-                        .into_iter()
-                        .find(|p| p.session_file(path).is_some())
-                })
-                .ok_or_else(|| OpenError::Unrecognized(path.clone()))?;
-            // Any file of a session opens the session: the rest of it, root
-            // included, is wherever the provider says files of one session are.
-            p.session_file(path)
-                .ok_or_else(|| OpenError::Unrecognized(path.clone()))?
         }
         // A sweep lists what `all_paths` returned, which for Claude is roots
         // only: the hit is expanded to its files below like any other.
@@ -573,6 +733,20 @@ mod tests {
             provider_of("\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}\n"),
             Some(Provider::Codex)
         );
+        // A Command Code header: `type == "session"` with a numeric version.
+        assert_eq!(
+            provider_of(r#"{"type":"session","version":3,"id":"x","cwd":"/project"}"#),
+            Some(Provider::CommandCode)
+        );
+        // A session without a numeric version is not Command Code's.
+        assert_eq!(
+            provider_of(r#"{"type":"session","id":"x"}"#),
+            Some(Provider::Claude)
+        );
+        assert_eq!(
+            provider_of(r#"{"type":"session","version":"3","id":"x"}"#),
+            Some(Provider::Claude)
+        );
         assert_eq!(
             provider_of(r#"{"type":"mode","mode":"normal","sessionId":"demo"}"#),
             Some(Provider::Claude)
@@ -583,9 +757,61 @@ mod tests {
             ),
             Some(Provider::Claude)
         );
+        // A whole jcode document classifies, however it is laid out.
+        assert_eq!(
+            provider_of(r#"{"id":"session_x","working_dir":"/p","messages":[{"id":"m1"}]}"#),
+            Some(Provider::Jcode)
+        );
+        assert_eq!(
+            provider_of(
+                "{\n  \"id\": \"session_x\",\n  \"working_dir\": \"/p\",\n  \"messages\": []\n}"
+            ),
+            Some(Provider::Jcode)
+        );
+        // A `messages` array alone is not a session (no working dir to join on).
+        assert_eq!(provider_of(r#"{"messages":[]}"#), None);
+        // A bare `{` — a jcode first line — classifies nothing; the layout
+        // fallback in `open` takes it from there.
+        assert_eq!(provider_of("{\n"), None);
         assert_eq!(provider_of(r#"{"agentType":"guide"}"#), None);
         assert_eq!(provider_of("not json"), None);
         assert_eq!(provider_of(""), None);
+        // Opencode's store is binary SQLite: no text head ever classifies as
+        // it, and neither do its exported transfer rows.
+        assert_eq!(
+            provider_of(r#"{"table":"part","id":"p1","message_id":"m1","session_id":"s1"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn hostile_collision_heads_stay_with_their_markers() {
+        // `messages` + `payload` but no jcode marker: Codex keeps it.
+        assert_eq!(
+            provider_of(r#"{"messages":[],"payload":{}}"#),
+            Some(Provider::Codex)
+        );
+        // A jcode document smuggling a top-level `payload` is still jcode.
+        assert_eq!(
+            provider_of(r#"{"id":"session_x","working_dir":"/p","messages":[],"payload":{}}"#),
+            Some(Provider::Jcode)
+        );
+        // A `session_` id + `messages` array marks jcode with no working dir.
+        assert_eq!(
+            provider_of(r#"{"id":"session_q_1_a","messages":[],"payload":{}}"#),
+            Some(Provider::Jcode)
+        );
+        // `messages` not an array + a Claude `type`: Claude, never jcode.
+        assert_eq!(
+            provider_of(r#"{"messages":"not-array","type":"user"}"#),
+            Some(Provider::Claude)
+        );
+        // A single-line Codex record carrying a `messages` array but no
+        // jcode marker stays Codex.
+        assert_eq!(
+            provider_of(r#"{"type":"event_msg","payload":{"type":"x"},"messages":[]}"#),
+            Some(Provider::Codex)
+        );
     }
 
     #[test]
@@ -646,6 +872,178 @@ mod tests {
         assert_eq!(sessions[0].files.len(), 1);
         assert_eq!(sessions[1].id, "b");
         assert!(sessions[1].files.is_empty());
+    }
+
+    /// The Command Code primitives: single-file sessions (nothing
+    /// related, nothing whole-read), the slug project key and the
+    /// layout-fallback order.
+    #[test]
+    fn commandcode_primitives_are_single_file() {
+        let f = SessionFile {
+            provider: Provider::CommandCode,
+            path: PathBuf::from("/x/projects/p/abc.jsonl"),
+            session: "abc".into(),
+            role: FileRole::Root,
+            read: ReadMode::Tail,
+            project_key: "p".into(),
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        assert!(Provider::CommandCode.related_paths(&f).is_empty());
+        assert!(matches!(
+            Provider::CommandCode.stream_for(&f),
+            Stream::CommandCode(_)
+        ));
+        assert_eq!(Provider::CommandCode.project_key(Path::new("/p")), "p");
+        assert_eq!(Provider::parse("commandcode"), Some(Provider::CommandCode));
+        assert!(Provider::ALL.contains(&Provider::CommandCode));
+        // The layout fallback walks `ALL` in order: a bare `<uuid>.jsonl`
+        // under `projects/` claims as Command Code before Claude's
+        // `.jsonl`-greedy classifier sees it.
+        assert!(
+            Provider::ALL
+                .into_iter()
+                .position(|p| p == Provider::CommandCode)
+                .unwrap()
+                < Provider::ALL
+                    .into_iter()
+                    .position(|p| p == Provider::Claude)
+                    .unwrap()
+        );
+    }
+
+    // S-015
+    #[test]
+    fn s_015_sweep_open_and_provider_flag() {
+        use crate::provider::commandcode::discovery;
+        use crate::provider::commandcode::test_env::EnvGuard;
+
+        // The name/parse surface.
+        assert_eq!(Provider::CommandCode.name(), "commandcode");
+        assert_eq!(Provider::parse("commandcode"), Some(Provider::CommandCode));
+        assert_eq!(
+            Provider::ALL,
+            [
+                Provider::Codex,
+                Provider::Opencode,
+                Provider::Jcode,
+                Provider::CommandCode,
+                Provider::Claude
+            ]
+        );
+
+        let tmp = std::env::temp_dir().join(format!(
+            "zoetrope-commandcode-s015-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let home = tmp.join("home");
+        let project = home.join("projects").join("home-prm-zoet-zoetrope");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = project.join("0e599cbe-23c4-460b-b097-cbd1d6bc0e3d.jsonl");
+        std::fs::write(
+            &session,
+            b"{\"type\":\"session\",\"version\":3,\"id\":\"0e599cbe-23c4-460b-b097-cbd1d6bc0e3d\",\"timestamp\":\"2026-09-30T10:00:00.000Z\",\"cwd\":\"/home/prm/zoet/zoetrope\"}\n",
+        )
+        .unwrap();
+        let stale = home
+            .join("projects")
+            .join("tmp")
+            .join("77777777-7777-4777-8777-777777777777.jsonl");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"").unwrap();
+        let outside = tmp
+            .join("outside")
+            .join("66666666-6666-4666-8666-666666666666.jsonl");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, b"").unwrap();
+
+        let guard = EnvGuard::with_home(&home);
+
+        // Project-scoped listing: exactly the project's uuid-named session.
+        let cwd = Path::new("/home/prm/zoet/zoetrope");
+        assert_eq!(
+            discovery::all_paths(&Scope::project(cwd)),
+            vec![session.clone()]
+        );
+        assert_eq!(
+            discovery::all_paths(&Scope::project(Path::new("/home/prm/zoet/zoetrope/"))),
+            vec![session.clone()],
+            "a trailing slash is the same project"
+        );
+
+        // Sweep, Command Code only — never the developer's real history.
+        for scope_cwd in [
+            Path::new("/home/prm/zoet/zoetrope"),
+            Path::new("/home/prm/zoet/zoetrope/"),
+        ] {
+            let hits = sweep(&Scope::project(scope_cwd), Some(Provider::CommandCode));
+            assert_eq!(hits.len(), 1, "one session for {scope_cwd:?}");
+            assert_eq!(hits[0].provider, Provider::CommandCode);
+            assert_eq!(hits[0].id, "0e599cbe-23c4-460b-b097-cbd1d6bc0e3d");
+            assert_eq!(hits[0].project_key, "home-prm-zoet-zoetrope");
+        }
+
+        // A just-created (empty) file directly under `projects/` opens as
+        // Command Code with the stem as id (O7); the same shape outside any
+        // projects tree still opens as Claude.
+        let provisional = open(&Target::Path(stale.clone()), None).expect("claims provisionally");
+        assert_eq!(provisional.provider, Provider::CommandCode);
+        assert_eq!(provisional.id, "77777777-7777-4777-8777-777777777777");
+        let claude = open(&Target::Path(outside.clone()), None).expect("Claude is .jsonl-greedy");
+        assert_eq!(claude.provider, Provider::Claude);
+
+        // The `--provider commandcode` flag path opens the header id.
+        let flagged =
+            open(&Target::Path(session.clone()), Some(Provider::CommandCode)).expect("opens");
+        assert_eq!(flagged.provider, Provider::CommandCode);
+        assert_eq!(flagged.id, "0e599cbe-23c4-460b-b097-cbd1d6bc0e3d");
+
+        // $COMMANDCODE_HOME wins over $HOME; with it unset, HOME/.commandcode.
+        let fallback = tmp.join("home-fallback");
+        guard.set_home(Some(&fallback));
+        assert_eq!(discovery::commandcode_home(), Some(home.clone()));
+        assert_eq!(discovery::projects_root(), Some(home.join("projects")));
+        guard.set_commandcode_home(None);
+        assert_eq!(
+            discovery::commandcode_home(),
+            Some(fallback.join(".commandcode"))
+        );
+        drop(guard);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Opencode is a single-file provider: a session has no neighbouring
+    /// files, no sidecars, and no browser classification (its store is a
+    /// binary database, not text).
+    #[test]
+    fn opencode_primitives_are_single_file() {
+        let f = SessionFile {
+            provider: Provider::Opencode,
+            path: PathBuf::from("/x/opencode.db"),
+            session: "s".into(),
+            role: FileRole::Root,
+            read: ReadMode::Whole,
+            project_key: String::new(),
+            modified: SystemTime::UNIX_EPOCH,
+        };
+        assert!(Provider::Opencode.related_paths(&f).is_empty());
+        assert!(Provider::Opencode.sidecar(&f, "{}").is_none());
+        assert!(
+            Provider::Opencode
+                .session_file_from(Path::new("/x/opencode.db"), "")
+                .is_none()
+        );
+        assert_eq!(Provider::Opencode.project_key(Path::new("/p")), "/p");
+        assert!(matches!(
+            Provider::Opencode.stream_for(&f),
+            Stream::Opencode(_)
+        ));
+        assert_eq!(Provider::parse("opencode"), Some(Provider::Opencode));
+        assert!(Provider::ALL.contains(&Provider::Opencode));
     }
 
     /// A live rescan reads the head of an unrelated rollout once, not on

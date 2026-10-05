@@ -253,11 +253,27 @@ impl Bundle {
 
     /// Feed newly-read text: appended bytes for a file already loaded, or a
     /// whole new file. Returns what it stated, in order.
+    ///
+    /// A torn rewritten document states nothing here, indistinguishable from
+    /// a steady one that has nothing new: both are empty. That merge is
+    /// deliberate, not a loss. Unlike the native tailer (which keeps the
+    /// `None` from [`Stream::push_doc`](crate::provider::Stream::push_doc)
+    /// and retries on the next tick), this batch hands over many files at
+    /// once and returns one `Vec`, so per-file retry state has nowhere to
+    /// live. The retry still happens: the document stream keeps its diff
+    /// state (nothing was marked seen), and the page resends the whole file,
+    /// so the completed rewrite states on the next append. Whole-read
+    /// sidecars likewise retry: only a parsed file joins `seen`.
     pub fn append(&mut self, files: &[(&str, &str)]) -> Vec<Statement> {
         let mut out = Vec::new();
         for (path, text) in files {
             if let Some(stream) = self.streams.get_mut(*path) {
-                out.extend(text.lines().filter_map(|l| stream.push(l)));
+                if stream.is_document() {
+                    // A rewritten document is handed over whole and diffed.
+                    out.extend(stream.push_doc(text).unwrap_or_default());
+                } else {
+                    out.extend(text.lines().filter_map(|l| stream.push(l)));
+                }
                 continue;
             }
             let Some(file) = self
@@ -275,7 +291,8 @@ impl Bundle {
     }
 
     /// One file's statements: through a new stream for a tailed file (kept for
-    /// appends), or its sidecar statement once it parses.
+    /// appends), its sidecar statement once it parses, or a kept document
+    /// stream that diffs each re-read.
     fn feed(&mut self, file: &SessionFile, text: &str) -> Vec<Statement> {
         let key = file.path.to_string_lossy().into_owned();
         match file.read {
@@ -297,6 +314,16 @@ impl Bundle {
                     // A mid-write read: retried on the next append.
                     None => Vec::new(),
                 }
+            }
+            // A rewritten document: the kept stream diffs each re-read
+            // against what it already stated. A mid-write read states
+            // nothing and is retried on the next append.
+            ReadMode::Doc => {
+                let stream = self
+                    .streams
+                    .entry(key)
+                    .or_insert_with(|| self.provider.stream_for(file));
+                stream.push_doc(text).unwrap_or_default()
             }
         }
     }
@@ -515,8 +542,34 @@ mod tests {
         );
     }
 
-    /// A Codex session dropped as its rollout files: the provider comes off
-    /// the content, the root is the `user` thread, a child appended later
+    /// A jcode document dropped and re-sent whole: a torn mid-write append
+    /// states nothing without poisoning the stream, and the completed
+    /// rewrite states only what is new. (The torn/steady merge above is why
+    /// this returns empty in both cases — the retry is the resend.)
+    #[test]
+    fn bundle_retries_a_torn_jcode_document_on_append() {
+        let doc =
+            |msgs: &str| format!(r#"{{"id":"session_x","working_dir":"/p","messages":[{msgs}]}}"#);
+        let m1 = r#"{"id":"m1","role":"user","timestamp":"2026-09-01T10:00:00.000Z","content":[{"type":"text","text":"hi"}]}"#;
+        let m2 = r#"{"id":"m2","role":"assistant","timestamp":"2026-09-01T10:00:05.000Z","content":[{"type":"text","text":"on it"}]}"#;
+        let (mut bundle, items, _info) = Bundle::load(&[("session_x.json", &doc(m1))]).unwrap();
+        assert_eq!(bundle.provider(), Provider::Jcode);
+        assert!(!items.is_empty(), "the load states the document");
+        // A torn mid-write resend: nothing, and the stream keeps its state.
+        assert!(
+            bundle
+                .append(&[("session_x.json", r#"{"id":"session_x","messages":[{"id":""#)])
+                .is_empty()
+        );
+        // The completed rewrite states only the new message.
+        let more = bundle.append(&[("session_x.json", &doc(&format!("{m1},{m2}")))]);
+        assert_eq!(more.len(), 1);
+        assert!(
+            matches!(&more[0].facts[0].kind, crate::fact::FactKind::Reasoning(t) if t == "on it")
+        );
+    }
+
+    /// A Codex session dropped as its rollout files: the provider comes off    /// the content, the root is the `user` thread, a child appended later
     /// continues to be read by the stream that learned whose file it is.
     #[test]
     fn bundle_reads_codex_rollouts_and_continues_streams_on_append() {
