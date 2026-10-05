@@ -2,13 +2,13 @@
 
 [Herdr](https://herdr.dev) runs coding agents in panes and knows which session
 each pane is running. This plugin asks it, then opens that session in `zoe` as
-a live flow graph, without you naming a file or an id. Claude Code and Codex
-panes both work.
+a live flow graph, without you naming a file or an id. Claude Code,
+Codex, Command Code, opencode and jcode panes all work.
 
 ## Installation
 
 ```bash
-herdr integration install claude          # and/or: herdr integration install codex
+herdr integration install claude          # and/or: codex, opencode, jcode (as Herdr ships them)
 herdr plugin install furkankly/zoetrope/herdr-plugin
 herdr plugin action invoke setup-keys --plugin furkankly.zoetrope
 ```
@@ -71,13 +71,18 @@ The pane says why and waits for you to press enter, rather than closing on you:
 
 | Herdr reports | What you see |
 | --- | --- |
-| an id for a `claude` or `codex` pane | the graph |
-| an agent but no session id | how to install the integration, and why the agent has to be restarted |
+| an id for a `claude`, `codex`, `opencode` or `jcode` pane | the graph |
+| an agent but no session id | the graph (a `cmd` or `jcode` pane, by directory), or how to install the integration |
 | no agent in the pane | a line saying to focus an agent pane |
 | an agent zoetrope does not read | the same, naming the agent |
 
-There is no fallback through the working directory. Herdr knows the session, so
-the plugin uses it or says what it got instead.
+There is no fallback through the working directory for Claude Code and Codex:
+Herdr knows the session, so the plugin uses it or says what it got instead. Two
+agents get the directory instead of an id: a **cmd** pane (Herdr 0.9.x ignores
+integrations' session refs — they arrive with 0.10's resume machinery) and a
+**jcode** pane (Herdr ships no jcode integration at all, so the id never
+reaches it). For both, the plugin follows the newest session of the pane's
+directory.
 
 ## Keys inside the graph
 
