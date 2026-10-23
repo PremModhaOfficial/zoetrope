@@ -104,6 +104,10 @@ src/
 │       ├── mod.rs       # the Codex provider: rollout lines → Facts through a `Stream` that learns its thread from its first line
 │       ├── wire.rs      # Codex's serde model: the envelope, `response_item`, `event_msg` and its `item_completed` items
 │       └── discovery.rs # the ~/.codex/sessions/YYYY/MM/DD layout: rollouts, the head read that classifies them, the primitives
+│   └── jcode/
+│       ├── mod.rs       # the jcode provider: whole-document diffs → Facts through a `Stream` keyed by message id + content hash; the tool-summary lexicon
+│       ├── wire.rs      # jcode's serde model: the session document, messages, content blocks (tool_use/tool_result)
+│       └── discovery.rs # the ~/.jcode/sessions layout: `session_*.json` documents, id/project reads, the primitives
 ├── state/
 │   ├── mod.rs     # App: owns the Flow + SessionModel + Timeline + SessionInfo + UI state; handle_ui_event, seek, camera
 │   ├── session.rs # SessionModel: the pure domain model (agents, statuses, tool calls) folded from Facts — knows no format
@@ -152,6 +156,35 @@ This is one provider's format, modelled in `provider/claude/wire.rs` and found o
 
 ### Tool calls
 `tool_use` names observed: Bash, Edit, Read, Write, ToolSearch, AskUserQuestion, Agent, Workflow, TaskStop, WebFetch. `Agent` input: `{description, prompt, subagent_type}`. Pair `tool_use.id` with the later user `tool_result.tool_use_id` → pending (no result yet = in-flight) vs complete (`is_error` decides Failed).
+
+## jcode session format (verified against live data, 391 sessions, 2026-10-05)
+
+One JSON document per session, rewritten on every turn, modelled in
+`provider/jcode/wire.rs` and found on disk by `provider/jcode/discovery.rs`.
+
+### Layout
+- Main: `~/.jcode/sessions/session_<name>_<ts>_<hex>.json` (shape only; the
+  document's own `id` is the session — a file whose JSON carries no `id` is
+  no session, not a stem-joined phantom). `working_dir` is the project key.
+- A session is exactly one file: the `session_*.journal.jsonl` append logs
+  beside it replay messages already in the document, so they are never tailed;
+  `.bak` snapshots are ignored. `related_paths` is empty.
+- No subagent transcripts: jcode keeps no child threads. Spawned swarm
+  workers run in sibling session files (joined only by a `target_session`
+  name in the tool input), so the provider states no `Agent` children.
+
+### Records → Facts (every message is *by* the root agent)
+- assistant `text`/`reasoning` (non-blank) → `Reasoning`.
+- assistant `tool_use {id, name, input}` → `ToolStart`, plus `Spawn` iff the
+  tool is `swarm` with `action: "spawn"` (the only spawner in the observed
+  vocabulary: bash/swarm/read/webfetch/todo/agentgrep/batch/edit/bg/…;
+  every other `swarm`/`bg` action only observes siblings).
+- user `tool_result {tool_use_id, is_error?}` → `ToolEnd` (`Ok` unless
+  `is_error: true`; missing means success, as in Claude's format).
+- user `text` → `Prompt`, unless `display_role` is `"system"` (injected
+  session context: never a prompt, at most `Activity`) or
+  `"background_task"` (a worker's completion notice: `Reasoning`).
+- Session rows off the timeline: `cwd`, `model`, `provider` (+ `Title`).
 
 ## Domain model (state/session.rs)
 
