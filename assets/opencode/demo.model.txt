@@ -1,0 +1,4 @@
+  ◌ [main] build  (idle) — id=main
+      I'll check the current font setting.
+      model: big-pickle
+      tools: 3 (2✓ 1✗ 0⏳)   tokens: 206
