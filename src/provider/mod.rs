@@ -74,6 +74,7 @@ use crate::fact::Statement;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod commandcode;
+pub(crate) mod opencode;
 pub(crate) mod summary;
 
 #[cfg(test)]
@@ -87,10 +88,11 @@ pub enum Provider {
     Claude,
     Codex,
     CommandCode,
+    Opencode,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Provider::Codex, Provider::CommandCode, Provider::Claude];
+    pub const ALL: [Provider; 4] = [Provider::Codex, Provider::Opencode, Provider::CommandCode, Provider::Claude];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
@@ -98,6 +100,7 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::CommandCode => "commandcode",
+            Provider::Opencode => "opencode",
         }
     }
 
@@ -120,6 +123,7 @@ pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
     CommandCode(commandcode::Stream),
+    Opencode(opencode::Stream),
 }
 
 impl Stream {
@@ -130,6 +134,7 @@ impl Stream {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
             Stream::CommandCode(s) => s.push(line),
+            Stream::Opencode(s) => s.push(line),
         }
     }
 }
@@ -349,6 +354,7 @@ impl Provider {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
             Provider::CommandCode => commandcode::discovery::all_paths(scope),
+            Provider::Opencode => opencode::discovery::all_paths(scope),
         }
     }
 
@@ -358,6 +364,7 @@ impl Provider {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
             Provider::CommandCode => commandcode::discovery::session_file(path),
+            Provider::Opencode => opencode::discovery::session_file(path),
         }
     }
 
@@ -369,6 +376,7 @@ impl Provider {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
             Provider::CommandCode => commandcode::discovery::related_paths(file),
+            Provider::Opencode => opencode::discovery::related_paths(file),
         }
     }
 
@@ -378,6 +386,7 @@ impl Provider {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
             Provider::CommandCode => commandcode::discovery::project_key(cwd),
+            Provider::Opencode => opencode::discovery::project_key(cwd),
         }
     }
 
@@ -389,6 +398,7 @@ impl Provider {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
             Provider::CommandCode => commandcode::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::Opencode => None,
         }
     }
 
@@ -398,6 +408,7 @@ impl Provider {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
             Provider::CommandCode => Stream::CommandCode(commandcode::discovery::stream_for(file)),
+            Provider::Opencode => Stream::Opencode(opencode::discovery::stream_for(file)),
         }
     }
 
@@ -409,6 +420,20 @@ impl Provider {
             Provider::Claude => claude::discovery::sidecar(file, text),
             Provider::Codex => None,
             Provider::CommandCode => commandcode::discovery::sidecar(file, text),
+            Provider::Opencode => opencode::discovery::sidecar(file, text),
+        }
+    }
+
+    /// A database-backed file's statements (opencode): rows from SQLite
+    /// through `stream`, only what is new on a re-read. Empty for every
+    /// other provider. Native only.
+    #[cfg(feature = "native")]
+    pub fn db_statements(self, file: &SessionFile, stream: &mut Stream) -> Vec<Statement> {
+        match (self, stream) {
+            (Provider::Opencode, Stream::Opencode(s)) => {
+                opencode::statements_for(&file.path, &file.session, s)
+            }
+            _ => Vec::new(),
         }
     }
 }
@@ -485,23 +510,33 @@ pub fn sweep(scope: &Scope, only: Option<Provider>) -> Vec<Session> {
 pub fn open(target: &Target, only: Option<Provider>) -> Result<Session, OpenError> {
     let file = match target {
         Target::Path(path) => {
-            if !path.is_file() {
-                return Err(OpenError::NotFound(target.clone()));
+            // Database pseudo-paths (`<db>/<session-id>`) name no file on
+            // disk, so classify them BEFORE the `is_file` gate below, which
+            // would reject them as not-found. `session_file` probes the parent
+            // database's SQLite magic, so a non-database path falls through.
+            if only.is_none_or(|o| o == Provider::Opencode)
+                && let Some(f) = Provider::Opencode.session_file(path)
+            {
+                f
+            } else {
+                if !path.is_file() {
+                    return Err(OpenError::NotFound(target.clone()));
+                }
+                // Content first; failing that (an empty, just-created file), the
+                // first provider whose layout claims the path.
+                let p = only
+                    .or_else(|| read_head(path).and_then(|head| provider_of(&head)))
+                    .or_else(|| {
+                        Provider::ALL
+                            .into_iter()
+                            .find(|p| p.session_file(path).is_some())
+                    })
+                    .ok_or_else(|| OpenError::Unrecognized(path.clone()))?;
+                // Any file of a session opens the session: the rest of it, root
+                // included, is wherever the provider says files of one session are.
+                p.session_file(path)
+                    .ok_or_else(|| OpenError::Unrecognized(path.clone()))?
             }
-            // Content first; failing that (an empty, just-created file), the
-            // first provider whose layout claims the path.
-            let p = only
-                .or_else(|| read_head(path).and_then(|head| provider_of(&head)))
-                .or_else(|| {
-                    Provider::ALL
-                        .into_iter()
-                        .find(|p| p.session_file(path).is_some())
-                })
-                .ok_or_else(|| OpenError::Unrecognized(path.clone()))?;
-            // Any file of a session opens the session: the rest of it, root
-            // included, is wherever the provider says files of one session are.
-            p.session_file(path)
-                .ok_or_else(|| OpenError::Unrecognized(path.clone()))?
         }
         // A sweep lists what `all_paths` returned, which for Claude is roots
         // only: the hit is expanded to its files below like any other.

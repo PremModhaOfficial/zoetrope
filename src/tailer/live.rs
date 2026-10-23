@@ -285,25 +285,28 @@ async fn poll_live(
 
     // --- root file ---
     let root_path = session.root_path().to_path_buf();
-    match read_appended(&root_path, &mut session.main_state) {
-        ReadResult::Reset => {
-            let _ = ui_tx
-                .send(UiEvent::SessionReset {
-                    session_id: session_id.to_string(),
-                })
-                .await;
-            // Truncation = re-attach: returning the SAME session makes run_live
-            // rebuild the whole LiveSession (fresh offsets, seen sidecars,
-            // backfill gate). Patching individual fields in place would leave
-            // the App's wiped model and the tailer's surviving state
-            // inconsistent — agents never re-emitted, and the re-read blips
-            // liveness.
-            return Some(session.reattach());
+    // FEEDER HUNK (opencode): the root is the database itself, not text.
+    if session.session.provider == Provider::Opencode
+        && session.session.root.read == ReadMode::Whole
+    {
+        let provider = session.session.provider;
+        let file = session.session.root.clone();
+        statements.extend(provider.db_statements(&file, &mut session.main_stream));
+    } else {
+        match read_appended(&root_path, &mut session.main_state) {
+            ReadResult::Reset => {
+                let _ = ui_tx
+                    .send(UiEvent::SessionReset {
+                        session_id: session_id.to_string(),
+                    })
+                    .await;
+                return Some(session.reattach());
+            }
+            ReadResult::Lines(lines) => {
+                statements.extend(lines.iter().filter_map(|l| session.main_stream.push(l)));
+            }
+            ReadResult::NoChange | ReadResult::Missing => {}
         }
-        ReadResult::Lines(lines) => {
-            statements.extend(lines.iter().filter_map(|l| session.main_stream.push(l)));
-        }
-        ReadResult::NoChange | ReadResult::Missing => {}
     }
 
     // --- the session's other files: known ones and any that appeared ---
@@ -373,10 +376,13 @@ async fn poll_live(
 /// The newest of `candidates` if it is a different session than `current`.
 /// Candidates come newest first from [`sweep`].
 fn newer_session(current: &Session, candidates: Vec<Session>) -> Option<Session> {
-    candidates
-        .into_iter()
-        .next()
-        .filter(|s| s.root.path != current.root.path)
+    candidates.into_iter().next().filter(|s| {
+        if s.provider == Provider::Opencode && current.provider == Provider::Opencode {
+            s.id != current.id
+        } else {
+            s.root.path != current.root.path
+        }
+    })
 }
 
 /// Read appended bytes from each tracked non-root file through its stream.

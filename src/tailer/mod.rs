@@ -56,6 +56,10 @@ mod replay;
 use live::run_live;
 #[cfg(feature = "native")]
 use replay::run_replay;
+// FEEDER HUNK (opencode): the database replay test builds a session through
+// the real bulk assembly; the re-export keeps the test at the provider.
+#[cfg(all(test, feature = "native"))]
+pub(crate) use replay::build_replay;
 
 /// Requests the UI sends to the tailer task.
 ///
