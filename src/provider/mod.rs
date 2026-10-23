@@ -73,6 +73,7 @@ use crate::fact::Statement;
 // browser frontend goes through `tailer::Bundle`.
 pub(crate) mod claude;
 pub(crate) mod codex;
+pub(crate) mod commandcode;
 pub(crate) mod summary;
 
 #[cfg(test)]
@@ -85,16 +86,18 @@ pub(crate) mod harness;
 pub enum Provider {
     Claude,
     Codex,
+    CommandCode,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::Claude, Provider::Codex];
+    pub const ALL: [Provider; 3] = [Provider::Codex, Provider::CommandCode, Provider::Claude];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::CommandCode => "commandcode",
         }
     }
 
@@ -116,6 +119,7 @@ impl Provider {
 pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
+    CommandCode(commandcode::Stream),
 }
 
 impl Stream {
@@ -125,6 +129,7 @@ impl Stream {
         match self {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
+            Stream::CommandCode(s) => s.push(line),
         }
     }
 }
@@ -139,6 +144,9 @@ pub fn provider_of(head: &str) -> Option<Provider> {
     let kind = obj.get("type").and_then(|t| t.as_str());
     if kind == Some("session_meta") || obj.contains_key("payload") {
         return Some(Provider::Codex);
+    }
+    if kind == Some("session") && obj.get("version").is_some_and(|v| v.is_number()) {
+        return Some(Provider::CommandCode);
     }
     kind.map(|_| Provider::Claude)
 }
@@ -340,6 +348,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
+            Provider::CommandCode => commandcode::discovery::all_paths(scope),
         }
     }
 
@@ -348,6 +357,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
+            Provider::CommandCode => commandcode::discovery::session_file(path),
         }
     }
 
@@ -358,6 +368,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
+            Provider::CommandCode => commandcode::discovery::related_paths(file),
         }
     }
 
@@ -366,6 +377,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
+            Provider::CommandCode => commandcode::discovery::project_key(cwd),
         }
     }
 
@@ -376,6 +388,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::CommandCode => commandcode::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
         }
     }
 
@@ -384,6 +397,7 @@ impl Provider {
         match self {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
+            Provider::CommandCode => Stream::CommandCode(commandcode::discovery::stream_for(file)),
         }
     }
 
@@ -394,6 +408,7 @@ impl Provider {
         match self {
             Provider::Claude => claude::discovery::sidecar(file, text),
             Provider::Codex => None,
+            Provider::CommandCode => commandcode::discovery::sidecar(file, text),
         }
     }
 }
