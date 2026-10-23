@@ -74,6 +74,7 @@ use crate::fact::Statement;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod commandcode;
+pub(crate) mod jcode;
 pub(crate) mod opencode;
 pub(crate) mod summary;
 
@@ -88,11 +89,12 @@ pub enum Provider {
     Claude,
     Codex,
     CommandCode,
+    Jcode,
     Opencode,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 4] = [Provider::Codex, Provider::Opencode, Provider::CommandCode, Provider::Claude];
+    pub const ALL: [Provider; 5] = [Provider::Codex, Provider::Opencode, Provider::Jcode, Provider::CommandCode, Provider::Claude];
 
     /// The name on the command line and under `assets/`.
     pub fn name(self) -> &'static str {
@@ -100,6 +102,7 @@ impl Provider {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
             Provider::CommandCode => "commandcode",
+            Provider::Jcode => "jcode",
             Provider::Opencode => "opencode",
         }
     }
@@ -123,6 +126,7 @@ pub enum Stream {
     Claude(claude::Stream),
     Codex(codex::Stream),
     CommandCode(commandcode::Stream),
+    Jcode(jcode::Stream),
     Opencode(opencode::Stream),
 }
 
@@ -134,8 +138,29 @@ impl Stream {
             Stream::Claude(s) => s.push(line),
             Stream::Codex(s) => s.push(line),
             Stream::CommandCode(s) => s.push(line),
+            Stream::Jcode(s) => s.push(line),
             Stream::Opencode(s) => s.push(line),
         }
+    }
+
+    /// State what a rewritten whole-document file now says that it did not
+    /// say before. `None` while the text does not parse (a torn mid-write
+    /// read); `Some` (possibly empty) once it does. Line providers state
+    /// nothing here.
+    pub fn push_doc(&mut self, text: &str) -> Option<Vec<Statement>> {
+        match self {
+            Stream::Claude(_) | Stream::Codex(_) | Stream::CommandCode(_) | Stream::Opencode(_) => {
+                Some(Vec::new())
+            }
+            Stream::Jcode(s) => s.push_doc(text),
+        }
+    }
+
+    /// Whether this stream reads a rewritten document ([`push_doc`](Self::push_doc))
+    /// rather than appended lines ([`push`](Self::push)). Feeders holding a
+    /// stream route re-reads through it.
+    pub fn is_document(&self) -> bool {
+        matches!(self, Stream::Jcode(_))
     }
 }
 
@@ -143,9 +168,32 @@ impl Stream {
 /// path or an extension: a Codex line carries a `payload`, a Claude line a
 /// `type` at the top level and nothing else this looks at.
 pub fn provider_of(head: &str) -> Option<Provider> {
+    // A whole document parses as one value; a tail file's lines never do
+    // (trailing records fail the parse), so try the whole text first and the
+    // first record after.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(head)
+        && let Some(p) = provider_of_value(&v)
+    {
+        return Some(p);
+    }
     let line = head.lines().find(|l| !l.trim().is_empty())?;
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    provider_of_value(&v)
+}
+
+/// Which provider wrote one parsed JSON value.
+fn provider_of_value(v: &serde_json::Value) -> Option<Provider> {
     let obj = v.as_object()?;
+    if obj.get("messages").is_some_and(|m| m.is_array())
+        && (obj.contains_key("working_dir")
+            || obj.contains_key("provider_key")
+            || obj
+                .get("id")
+                .and_then(|i| i.as_str())
+                .is_some_and(|s| s.starts_with("session_")))
+    {
+        return Some(Provider::Jcode);
+    }
     let kind = obj.get("type").and_then(|t| t.as_str());
     if kind == Some("session_meta") || obj.contains_key("payload") {
         return Some(Provider::Codex);
@@ -192,6 +240,7 @@ pub enum FileRole {
 pub enum ReadMode {
     Tail,
     Whole,
+    Doc,
 }
 
 /// What the core assembles from files. Never produced by a provider.
@@ -354,6 +403,7 @@ impl Provider {
             Provider::Claude => claude::discovery::all_paths(scope),
             Provider::Codex => codex::discovery::all_paths(scope),
             Provider::CommandCode => commandcode::discovery::all_paths(scope),
+            Provider::Jcode => jcode::discovery::all_paths(scope),
             Provider::Opencode => opencode::discovery::all_paths(scope),
         }
     }
@@ -364,6 +414,7 @@ impl Provider {
             Provider::Claude => claude::discovery::session_file(path),
             Provider::Codex => codex::discovery::session_file(path),
             Provider::CommandCode => commandcode::discovery::session_file(path),
+            Provider::Jcode => jcode::discovery::session_file(path),
             Provider::Opencode => opencode::discovery::session_file(path),
         }
     }
@@ -376,6 +427,7 @@ impl Provider {
             Provider::Claude => claude::discovery::related_paths(file),
             Provider::Codex => codex::discovery::related_paths(file),
             Provider::CommandCode => commandcode::discovery::related_paths(file),
+            Provider::Jcode => jcode::discovery::related_paths(file),
             Provider::Opencode => opencode::discovery::related_paths(file),
         }
     }
@@ -386,6 +438,7 @@ impl Provider {
             Provider::Claude => claude::discovery::project_key(cwd),
             Provider::Codex => codex::discovery::project_key(cwd),
             Provider::CommandCode => commandcode::discovery::project_key(cwd),
+            Provider::Jcode => jcode::discovery::project_key(cwd),
             Provider::Opencode => opencode::discovery::project_key(cwd),
         }
     }
@@ -398,6 +451,7 @@ impl Provider {
             Provider::Claude => claude::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Codex => codex::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
             Provider::CommandCode => commandcode::discovery::classify_head(path, head, SystemTime::UNIX_EPOCH),
+            Provider::Jcode => jcode::discovery::classify_path(path, SystemTime::UNIX_EPOCH),
             Provider::Opencode => None,
         }
     }
@@ -408,6 +462,7 @@ impl Provider {
             Provider::Claude => Stream::Claude(claude::discovery::stream_for(file)),
             Provider::Codex => Stream::Codex(codex::Stream::new()),
             Provider::CommandCode => Stream::CommandCode(commandcode::discovery::stream_for(file)),
+            Provider::Jcode => Stream::Jcode(jcode::discovery::stream_for(file)),
             Provider::Opencode => Stream::Opencode(opencode::discovery::stream_for(file)),
         }
     }
@@ -420,6 +475,7 @@ impl Provider {
             Provider::Claude => claude::discovery::sidecar(file, text),
             Provider::Codex => None,
             Provider::CommandCode => commandcode::discovery::sidecar(file, text),
+            Provider::Jcode => None,
             Provider::Opencode => opencode::discovery::sidecar(file, text),
         }
     }

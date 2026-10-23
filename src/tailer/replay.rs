@@ -131,6 +131,19 @@ pub(crate) fn build_replay(
                     seed.seen_whole.insert(file.path.clone());
                 }
             }
+            // A rewritten document states only what is new since its stream
+            // last saw it. The stream is kept for the follow-up tail, which
+            // re-reads the file through it. A mid-write read states nothing
+            // and keeps no stream (retried on the next tick).
+            ReadMode::Doc => {
+                if let Ok(text) = std::fs::read_to_string(&file.path) {
+                    let mut stream = p.stream_for(file);
+                    if let Some(statements) = stream.push_doc(&text) {
+                        items.extend(statements.into_iter().map(ReplayItem::new));
+                        seed.streams.insert(file.path.clone(), stream);
+                    }
+                }
+            }
         }
     }
 
